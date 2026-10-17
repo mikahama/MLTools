@@ -2,6 +2,72 @@
 
 MLTools is a deliberately small, friendly Python library for machine-learning tasks.
 
+## Word embeddings
+
+Train dependency-light word2vec or fastText-style embeddings directly from a
+string, text files, and/or folders (folders are searched recursively; hidden
+files are ignored):
+
+```python
+from MLTools.LM import word_embeddings
+
+model = word_embeddings.train("my_embeddings", text="A dog chases a cat.",
+                              files=["books", "notes.txt"], model_type="fasttext")
+model.similarity("dog", "cat")
+model.nearest_neighbors("dog")
+model.embed("dog")
+model.word(model.embed("dog"))
+model.cluster(["dog", "cat", "car", "bike"], method="dbscan")
+
+# Load it later.
+model = word_embeddings.load_model("my_embeddings")
+```
+
+## Foundation models
+
+`foundation_models` is a small wrapper around Hugging Face encoder models. It
+trains BERT by default with masked-language modelling; set `model_type="roberta"`
+or pass a compatible Hugging Face `model_name` to use another BERT-style model.
+
+```python
+from MLTools.LM import foundation_models
+
+model = foundation_models.train("my_bert", text="My corpus...", files=["books"])
+model.similarity("dog is funny", "cat is crazy")
+embedding = model.embed("dog is funny")
+model.cluster(["dog is funny", "cat is crazy", "cars are big", "bikes are fast"])
+
+model = foundation_models.load_model("my_bert")
+# Hub IDs work too: foundation_models.load_model("bert-base-uncased")
+
+data = [["this is cool", "positive"], ["this is bad", "negative"]]
+classifier = model.fine_tune("sentiment_model", data, "classification")
+classifier.predict("this dog is funny")
+```
+
+For sentence-pair classification, use `[first_text, second_text, label]`; for
+regression, use `[text, number]` with `task="regression"`.
+
+## GPT-style language models
+
+Fine-tune GPT-2 (the default) or another Hugging Face causal model directly on
+your files and generate continuations. `fine_tune` updates and returns the
+model, so either call style is valid.
+
+```python
+from MLTools.LM import gpts
+
+model = gpts.train("my_gpt", text="My corpus...", files=["books"])
+model.predict("Hi, how are you?")
+model.similarity("dog is funny", "cat is crazy")
+model.embed("dog is funny")
+model.cluster(["dog is funny", "cat is crazy", "cars are big", "bikes are fast"])
+
+model = gpts.load_model("my_gpt")
+model.fine_tune("new_gpt", text="More corpus text")
+model.predict("Hi, how are you?")
+```
+
 ## Text to text models
 
 ```python
