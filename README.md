@@ -23,6 +23,28 @@ model.cluster(["dog", "cat", "car", "bike"], method="dbscan")
 model = word_embeddings.load_model("my_embeddings")
 ```
 
+For morphologically rich languages, `model_type="morph"` builds every word
+vector from its character n-grams *and* its morphological analyses (lemma +
+tags), so all inflected forms of a word share a lemma vector, and unseen forms
+can still be embedded. Give it an `analyzer`: a function that returns analyses
+such as `["kudo+N+Sg+Ine"]`, or the path to an HFST `.hfstol` analyser (read
+with the optional [pyhfst](https://github.com/Rootroo-ltd/pyhfst) package).
+
+```python
+from uralicNLP import uralicApi
+
+analyzer = lambda word: [a for a, _ in uralicApi.analyze(word, "myv")]
+model = word_embeddings.train("erzya_embeddings", files=["erzya.txt"],
+                              model_type="morph", analyzer=analyzer)
+model.similarity("кудо", "кудосо")   # house ~ in the house
+
+# An .hfstol path is stored with the model and reloaded automatically;
+# pass analyzer=... again if you trained with a Python function.
+model = word_embeddings.train("erzya_embeddings", files=["erzya.txt"],
+                              model_type="morph", analyzer="myv/analyser-gt-desc.hfstol")
+model = word_embeddings.load_model("erzya_embeddings")
+```
+
 ## Foundation models
 
 `foundation_models` is a small wrapper around Hugging Face encoder models. It
