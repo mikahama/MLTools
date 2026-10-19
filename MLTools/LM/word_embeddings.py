@@ -3,6 +3,9 @@
 The implementation intentionally only depends on PyTorch, which MLTools already
 uses.  It provides skip-gram training with negative sampling; ``fasttext`` adds
 character n-gram vectors so it can embed words not seen during training.
+``morph`` additionally composes each word from its morphological analyses
+(lemma + tags), e.g. from an FST, so that all inflected forms of a lemma share a
+vector even when their spelling differs (consonant gradation, stem changes).
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import random
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -53,6 +56,28 @@ def _read_files(files: Union[str, Path, Sequence[Union[str, Path]]]) -> str:
     return "\n".join(pieces)
 
 
+Analyzer = Callable[[str], Sequence[str]]
+
+
+def _load_analyzer(analyzer: Union[None, str, Path, Analyzer]) -> Optional[Analyzer]:
+    """Accept a callable ``word -> ["lemma+TAG+TAG", ...]`` or a path to an HFST optimized-lookup
+    (.hfstol) analyser, which is read with the optional pyhfst package."""
+    if analyzer is None or callable(analyzer):
+        return analyzer
+    try:
+        import pyhfst
+    except ImportError as exc:
+        raise ImportError("Reading an .hfstol analyser requires pyhfst (pip install pyhfst).") from exc
+    transducer = pyhfst.HfstInputStream(str(analyzer)).read()
+    return lambda word: [result[0] for result in transducer.lookup(word)]
+
+
+def _parse_analysis(analysis: str) -> Tuple[str, List[str]]:
+    """'kudo+N+Sg+Ine' -> ('kudo', ['N', 'Sg', 'Ine']); for compounds the last part is used."""
+    parts = [part for part in analysis.split("#")[-1].split("+") if part]
+    return (parts[0], parts[1:]) if parts else (analysis, [])
+
+
 def _ngrams(word: str, minimum: int, maximum: int) -> List[str]:
     marked = f"<{word}>"
     return [marked[i : i + size] for size in range(minimum, maximum + 1)
@@ -60,22 +85,34 @@ def _ngrams(word: str, minimum: int, maximum: int) -> List[str]:
 
 
 class _SkipGram(nn.Module):
-    def __init__(self, vocabulary_size: int, dimension: int, model_type: str, bucket_size: int) -> None:
+    def __init__(self, vocabulary_size: int, dimension: int, model_type: str, bucket_size: int,
+                 lemma_size: int = 0, tag_size: int = 0) -> None:
         super().__init__()
         self.model_type = model_type
         self.input = nn.Embedding(vocabulary_size, dimension)
         self.output = nn.Embedding(vocabulary_size, dimension)
-        self.subwords = nn.EmbeddingBag(bucket_size, dimension, mode="mean") if model_type == "fasttext" else None
+        self.subwords = nn.EmbeddingBag(bucket_size, dimension, mode="mean") if model_type in {"fasttext", "morph"} else None
+        self.lemmas = nn.Embedding(max(lemma_size, 1), dimension) if model_type == "morph" else None
+        self.tags = nn.EmbeddingBag(max(tag_size, 1), dimension, mode="mean") if model_type == "morph" else None
         bound = 0.5 / max(dimension, 1)
         nn.init.uniform_(self.input.weight, -bound, bound)
         nn.init.zeros_(self.output.weight)
-        if self.subwords is not None:
-            nn.init.uniform_(self.subwords.weight, -bound, bound)
+        for table in (self.subwords, self.lemmas, self.tags):
+            if table is not None:
+                nn.init.uniform_(table.weight, -bound, bound)
 
-    def vectors(self, words: Tensor, subword_ids: Optional[Tensor] = None, offsets: Optional[Tensor] = None) -> Tensor:
+    def vectors(self, words: Tensor, subword_ids: Optional[Tensor] = None, offsets: Optional[Tensor] = None,
+                morphology: Optional[Tuple[Tensor, Tensor, Tensor, Tensor]] = None) -> Tensor:
         result = self.input(words)
         if self.subwords is not None and subword_ids is not None and offsets is not None:
             result = result + self.subwords(subword_ids, offsets)
+        if self.lemmas is not None and morphology is not None and len(morphology[0]):
+            # morphology = (lemma ids, tag ids, tag offsets, owner word index), one row per analysis
+            lemma_ids, tag_ids, tag_offsets, owners = morphology
+            analyses = self.lemmas(lemma_ids) + self.tags(tag_ids, tag_offsets)
+            total = torch.zeros_like(result).index_add_(0, owners, analyses)
+            count = torch.zeros(len(result), device=result.device).index_add_(0, owners, torch.ones_like(owners, dtype=result.dtype))
+            result = result + total / count.clamp_min(1).unsqueeze(1)
         return result
 
 
@@ -85,14 +122,16 @@ class WordEmbeddings:
     Use :meth:`embed`, :meth:`similarity`, :meth:`nearest_neighbors`, and
     :meth:`cluster` to explore vocabulary in a corpus.
     """
-    def __init__(self, network: _SkipGram, vocabulary: List[str], config: Dict, folder: Union[str, Path]) -> None:
+    def __init__(self, network: _SkipGram, vocabulary: List[str], config: Dict, folder: Union[str, Path],
+                 analyzer: Optional[Analyzer] = None, morph_vocab: Optional[Dict[str, Dict[str, int]]] = None) -> None:
         self.network, self.vocabulary, self.config, self.folder = network, vocabulary, config, Path(folder)
         self.word_to_id = {word: index for index, word in enumerate(vocabulary)}
+        self.analyzer, self.morph_vocab = analyzer, morph_vocab or {"lemmas": {}, "tags": {}}
         self.device = torch.device(config.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.network.to(self.device).eval()
 
     def _subword_data(self, words: Sequence[str]) -> Tuple[Optional[Tensor], Optional[Tensor]]:
-        if self.config["model_type"] != "fasttext":
+        if self.config["model_type"] not in {"fasttext", "morph"}:
             return None, None
         buckets = self.config["bucket_size"]
         all_ids, offsets = [], []
@@ -103,11 +142,16 @@ class WordEmbeddings:
             all_ids.extend(_stable_hash(gram) % buckets for gram in grams or [word])
         return torch.tensor(all_ids, device=self.device), torch.tensor(offsets, device=self.device)
 
+    def _morphology(self, words: Sequence[str]) -> Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]:
+        if self.config["model_type"] != "morph" or self.analyzer is None:
+            return None
+        return _morphology_tensors(words, self.analyzer, self.morph_vocab, self.device, self.config.get("max_analyses", 6))
+
     def _vectors(self, words: Sequence[str]) -> Tensor:
         ids = torch.tensor([self.word_to_id.get(word, 0) for word in words], device=self.device)
         subword_ids, offsets = self._subword_data(words)
         with torch.no_grad():
-            vectors = self.network.vectors(ids, subword_ids, offsets)
+            vectors = self.network.vectors(ids, subword_ids, offsets, self._morphology(words))
         # word2vec has no useful vector for out-of-vocabulary words.
         missing = [word for word in words if word not in self.word_to_id]
         if missing and self.config["model_type"] == "word2vec":
@@ -175,6 +219,27 @@ class WordEmbeddings:
         return dict(groups)
 
 
+def _morphology_tensors(words: Sequence[str], analyzer: Analyzer, vocab: Dict[str, Dict[str, int]], device,
+                        max_analyses: int = 6, grow: bool = False) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Build (lemma ids, tag ids, tag offsets, owner index) for the analyses of ``words``.
+    Unknown lemmas/tags are skipped unless ``grow`` adds them to ``vocab`` (training time)."""
+    lemma_ids, tag_ids, tag_offsets, owners = [], [], [], []
+    for index, word in enumerate(words):
+        for analysis in list(dict.fromkeys(analyzer(word)))[:max_analyses]:
+            lemma, tags = _parse_analysis(analysis)
+            if lemma not in vocab["lemmas"]:
+                if not grow: continue
+                vocab["lemmas"][lemma] = len(vocab["lemmas"])
+            ids = []
+            for tag in tags or ["<none>"]:
+                if tag not in vocab["tags"] and grow: vocab["tags"][tag] = len(vocab["tags"])
+                if tag in vocab["tags"]: ids.append(vocab["tags"][tag])
+            tag_offsets.append(len(tag_ids)); tag_ids.extend(ids or [0])
+            lemma_ids.append(vocab["lemmas"][lemma]); owners.append(index)
+    as_tensor = lambda values: torch.tensor(values, dtype=torch.long, device=device)
+    return as_tensor(lemma_ids), as_tensor(tag_ids), as_tensor(tag_offsets), as_tensor(owners)
+
+
 def _stable_hash(value: str) -> int:
     result = 2166136261
     for byte in value.encode("utf-8"):
@@ -230,18 +295,23 @@ def train(folder: Union[str, Path], *, text: Optional[str] = None, files: Option
           model_type: str = "word2vec", dimension: int = 100, window: int = 5, min_frequency: int = 1,
           epochs: int = 5, learning_rate: float = 0.025, negative_samples: int = 5, batch_size: int = 512,
           lowercase: bool = True, min_n: int = 3, max_n: int = 6, bucket_size: int = 100_000,
+          analyzer: Union[None, str, Path, Analyzer] = None, max_analyses: int = 6,
           seed: Optional[int] = 42, device: Optional[Union[str, torch.device]] = None) -> WordEmbeddings:
-    """Train and save word2vec or fastText-style embeddings.
+    """Train and save word2vec, fastText-style or morphology-aware embeddings.
 
     Supply ``text``, ``files`` (files and/or folders), or both.  ``model_type``
-    is ``"word2vec"`` or ``"fasttext"``.  The resulting model is saved in
-    ``folder`` and returned.
+    is ``"word2vec"``, ``"fasttext"`` or ``"morph"``.  ``morph`` needs an
+    ``analyzer``: a function returning analyses such as ``["kudo+N+Sg+Ine"]``
+    for a word (for example UralicNLP's ``analyze``), or a path to an ``.hfstol``
+    FST (read with pyhfst).  The resulting model is saved in ``folder`` and returned.
     """
     if text is None and files is None: raise ValueError("Provide text, files, or both.")
     if text is not None and not isinstance(text, str): raise TypeError("text must be a string.")
     if not isinstance(model_type, str): raise TypeError("model_type must be a string.")
     model_type = model_type.lower().replace("-", "")
-    if model_type not in {"word2vec", "fasttext"}: raise ValueError("model_type must be 'word2vec' or 'fasttext'.")
+    if model_type not in {"word2vec", "fasttext", "morph"}: raise ValueError("model_type must be 'word2vec', 'fasttext' or 'morph'.")
+    analyze = _load_analyzer(analyzer)
+    if model_type == "morph" and analyze is None: raise ValueError("model_type='morph' needs an analyzer (a callable or an .hfstol path).")
     if min_frequency < 1 or dimension < 1 or window < 1 or epochs < 1 or negative_samples < 1 or batch_size < 1: raise ValueError("dimension, window, epochs, negative_samples, batch_size, and min_frequency must be positive.")
     if min_n < 1 or max_n < min_n or bucket_size < 1: raise ValueError("Require 1 <= min_n <= max_n and a positive bucket_size.")
     corpus = "\n".join(part for part in (text or "", _read_files(files) if files is not None else "") if part)
@@ -254,8 +324,16 @@ def train(folder: Union[str, Path], *, text: Optional[str] = None, files: Option
     pairs = [(center, ids[context]) for i, center in enumerate(ids) for context in range(max(0, i-window), min(len(ids), i+window+1)) if context != i]
     if not pairs: raise ValueError("The corpus is too short to form training contexts.")
     if seed is not None: random.seed(seed); torch.manual_seed(seed)
-    config = {"model_type": model_type, "dimension": dimension, "window": window, "min_frequency": min_frequency, "lowercase": lowercase, "min_n": min_n, "max_n": max_n, "bucket_size": bucket_size, "device": str(device) if device else None}
-    network = _SkipGram(len(vocabulary), dimension, model_type, bucket_size)
+    config = {"model_type": model_type, "dimension": dimension, "window": window, "min_frequency": min_frequency, "lowercase": lowercase, "min_n": min_n, "max_n": max_n, "bucket_size": bucket_size, "max_analyses": max_analyses, "device": str(device) if device else None}
+    if isinstance(analyzer, (str, Path)): config["analyzer"] = str(analyzer)
+    morph_vocab: Dict[str, Dict[str, int]] = {"lemmas": {}, "tags": {"<none>": 0}}
+    word_morphology: Dict[int, List[Tuple[int, List[int]]]] = {}
+    if model_type == "morph":
+        for index, word in enumerate(tqdm(vocabulary, desc="Analysing vocabulary", unit="word")):
+            lemma_ids, tag_ids, tag_offsets, _ = _morphology_tensors([word], analyze, morph_vocab, "cpu", max_analyses, grow=True)
+            bounds = tag_offsets.tolist() + [len(tag_ids)]
+            word_morphology[index] = [(int(lemma), tag_ids[bounds[k]:bounds[k + 1]].tolist()) for k, lemma in enumerate(lemma_ids)]
+    network = _SkipGram(len(vocabulary), dimension, model_type, bucket_size, len(morph_vocab["lemmas"]), len(morph_vocab["tags"]))
     target_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu")); network.to(target_device)
     optimizer = torch.optim.SGD(network.parameters(), lr=learning_rate)
     weights = torch.tensor([counts[word] ** 0.75 for word in vocabulary], dtype=torch.float); weights /= weights.sum()
@@ -267,32 +345,47 @@ def train(folder: Union[str, Path], *, text: Optional[str] = None, files: Option
             centers = torch.tensor([pair[0] for pair in chunk], device=target_device)
             contexts = torch.tensor([pair[1] for pair in chunk], device=target_device)
             negative = torch.multinomial(weights, len(chunk) * negative_samples, replacement=True).view(len(chunk), negative_samples).to(target_device)
-            subword_ids = offsets = None
-            if model_type == "fasttext":
+            subword_ids = offsets = morphology = None
+            if model_type == "morph":
+                lemma_ids, tag_ids, tag_offsets, owners = [], [], [], []
+                for row, center in enumerate(centers.tolist()):
+                    for lemma, tags in word_morphology[center]:
+                        tag_offsets.append(len(tag_ids)); tag_ids.extend(tags or [0]); lemma_ids.append(lemma); owners.append(row)
+                as_tensor = lambda values: torch.tensor(values, dtype=torch.long, device=target_device)
+                morphology = (as_tensor(lemma_ids), as_tensor(tag_ids), as_tensor(tag_offsets), as_tensor(owners))
+            if model_type in {"fasttext", "morph"}:
                 ids_flat, starts = [], []
                 for center in centers.tolist():
                     starts.append(len(ids_flat)); ids_flat.extend(_stable_hash(g) % bucket_size for g in _ngrams(vocabulary[center], min_n, max_n))
                 subword_ids, offsets = torch.tensor(ids_flat, device=target_device), torch.tensor(starts, device=target_device)
-            inputs = network.vectors(centers, subword_ids, offsets)
+            inputs = network.vectors(centers, subword_ids, offsets, morphology)
             positive = (inputs * network.output(contexts)).sum(dim=1)
             negative_score = torch.bmm(network.output(negative), inputs.unsqueeze(2)).squeeze(2)
             loss = -(F.logsigmoid(positive).mean() + F.logsigmoid(-negative_score).mean())
             optimizer.zero_grad(); loss.backward(); optimizer.step()
             progress.set_postfix(loss=f"{loss.item():.3f}")
     output = Path(folder); output.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": network.cpu().state_dict(), "vocabulary": vocabulary, "config": config}, output / _STATE_FILE)
+    torch.save({"state_dict": network.cpu().state_dict(), "vocabulary": vocabulary, "config": config, "morph_vocab": morph_vocab}, output / _STATE_FILE)
     (output / _INFO_FILE).write_text(json.dumps({"model_type": model_type, "vocabulary_size": len(vocabulary), **config}, indent=2), encoding="utf-8")
-    return WordEmbeddings(network, vocabulary, config, output)
+    return WordEmbeddings(network, vocabulary, config, output, analyze, morph_vocab)
 
 
-def load_model(folder: Union[str, Path], *, device: Optional[Union[str, torch.device]] = None) -> WordEmbeddings:
-    """Load a model previously saved by :func:`train`."""
+def load_model(folder: Union[str, Path], *, device: Optional[Union[str, torch.device]] = None,
+               analyzer: Union[None, str, Path, Analyzer] = None) -> WordEmbeddings:
+    """Load a model previously saved by :func:`train`.
+
+    ``morph`` models trained with an ``.hfstol`` path reload it automatically; pass
+    ``analyzer`` again if the model was trained with a Python function.
+    """
     folder = Path(folder); state_path = folder / _STATE_FILE
     if not state_path.is_file(): raise FileNotFoundError(f"No embedding model found at {state_path}")
     state = torch.load(state_path, map_location="cpu", weights_only=False)
     config = state["config"].copy()
     if device is not None: config["device"] = str(device)
-    network = _SkipGram(len(state["vocabulary"]), config["dimension"], config["model_type"], config["bucket_size"])
+    morph_vocab = state.get("morph_vocab") or {"lemmas": {}, "tags": {}}
+    network = _SkipGram(len(state["vocabulary"]), config["dimension"], config["model_type"], config["bucket_size"],
+                        len(morph_vocab["lemmas"]), len(morph_vocab["tags"]))
     network.load_state_dict(state["state_dict"])
-    return WordEmbeddings(network, state["vocabulary"], config, folder)
+    analyze = _load_analyzer(analyzer if analyzer is not None else config.get("analyzer"))
+    return WordEmbeddings(network, state["vocabulary"], config, folder, analyze, morph_vocab)
 
