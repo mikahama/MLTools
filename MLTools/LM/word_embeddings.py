@@ -389,3 +389,160 @@ def load_model(folder: Union[str, Path], *, device: Optional[Union[str, torch.de
     analyze = _load_analyzer(analyzer if analyzer is not None else config.get("analyzer"))
     return WordEmbeddings(network, state["vocabulary"], config, folder, analyze, morph_vocab)
 
+
+
+# ---------------------------------------------------------------------------
+# Pretrained MorphEmb vectors (Alnajjar et al., IWCLUL 2026)
+# ---------------------------------------------------------------------------
+
+_PIVOTS = {"eng", "fin", "rus"}
+
+
+class MorphEmbeddings:
+    """Pretrained MorphEmb vectors for Uralic languages, English, Finnish and Russian, in one vector space.
+
+    The vector of a word is the average of its character n-gram vectors plus the average over its FST analyses
+    of the lemma vector and the average tag vector, so that any word the FST can analyse gets a vector.
+    Words that the FST does not know get the n-gram part only.  Load with :func:`load_morphemb`.
+    """
+    def __init__(self, folder: Union[str, Path], languages: Sequence[str], analyzer, device) -> None:
+        from safetensors.torch import load_file
+        self.folder = Path(folder)
+        self.config = json.loads((self.folder / "config.json").read_text(encoding="utf-8"))
+        self.device = torch.device(device or "cpu")
+        shared = load_file(str(self.folder / "shared.safetensors"))
+        self.char, self.tag = shared["char"].to(self.device), shared["tag"].to(self.device)
+        self.tag_ids = {tag: i for i, tag in enumerate(self.config["tags"])}
+        self.lemma_vectors, self.lemma_ids, self.lemma_lists = {}, {}, {}
+        for lang in languages:
+            if lang not in self.config["languages"]:
+                raise ValueError(f"No vectors for {lang!r}; available: {', '.join(self.config['languages'])}")
+            self.lemma_vectors[lang] = load_file(str(self.folder / "lemmas" / f"{lang}.safetensors"))["lemma"].to(self.device)
+            lemmas = (self.folder / "lemmas" / f"{lang}.txt").read_text(encoding="utf-8").split("\n")[:-1]
+            self.lemma_lists[lang], self.lemma_ids[lang] = lemmas, {lemma: i for i, lemma in enumerate(lemmas)}
+        self.analyzer = analyzer
+        self._cache: Dict[str, Tensor] = {}
+
+    def _analyses(self, word: str, lang: str) -> List[str]:
+        if lang in _PIVOTS or self.analyzer is None:
+            return []
+        return list(self.analyzer(word, lang)) or (list(self.analyzer(word.lower(), lang)) if word != word.lower() else [])
+
+    def _ngram_ids(self, word: str) -> List[int]:
+        import zlib
+        low, high = self.config["ngrams"]
+        return [zlib.crc32(gram.encode()) % self.config["buckets"] for gram in _ngrams(word, low, high)] or [0]
+
+    def _vector(self, word: str, lang: str) -> Tensor:
+        if lang not in self.lemma_ids:
+            raise ValueError(f"{lang!r} was not loaded; pass it to load_morphemb(languages=...).")
+        vector = self.char[torch.tensor(self._ngram_ids(word), device=self.device)].float().mean(0)
+        parts, none = [], self.tag_ids["<none>"]
+        if lang in _PIVOTS:  # pivot words have a whole-word "lemma" and no tags
+            lemma = self.lemma_ids[lang].get(word.lower())
+            if lemma is not None:
+                parts.append(self.lemma_vectors[lang][lemma].float() + self.tag[none].float())
+        for analysis in self._analyses(word, lang)[: self.config["max_analyses"]]:
+            pieces = [p for p in analysis.split("#")[-1].split("+") if p]
+            lemma = self.lemma_ids[lang].get(pieces[0]) if pieces else None
+            if lemma is None:
+                continue
+            tags = [self.tag_ids.get(t, none) for t in pieces[1:]] or [none]
+            parts.append(self.lemma_vectors[lang][lemma].float() + self.tag[torch.tensor(tags, device=self.device)].float().mean(0))
+        if parts:
+            vector = vector + torch.stack(parts).mean(0)
+        return vector
+
+    def _vectors(self, words: Sequence[str], lang: str) -> Tensor:
+        """The vectors of many words at once (the same sums as ``_vector``, computed with ``embedding_bag``)."""
+        ids, none = self.lemma_ids[lang], self.tag_ids["<none>"]
+        grams, offsets, part_word, part_lemma, tags, tag_offsets = [], [], [], [], [], []
+        for k, word in enumerate(words):
+            offsets.append(len(grams))
+            grams += self._ngram_ids(word)
+            analyses = []
+            if lang in _PIVOTS:
+                lemma = ids.get(word.lower())
+                if lemma is not None:
+                    analyses.append((lemma, [none]))
+            for analysis in self._analyses(word, lang)[: self.config["max_analyses"]]:
+                pieces = [p for p in analysis.split("#")[-1].split("+") if p]
+                lemma = ids.get(pieces[0]) if pieces else None
+                if lemma is not None:
+                    analyses.append((lemma, [self.tag_ids.get(t, none) for t in pieces[1:]] or [none]))
+            for lemma, tag_ids in analyses:
+                part_word.append(k); part_lemma.append(lemma)
+                tag_offsets.append(len(tags)); tags += tag_ids
+        tensor = lambda x: torch.tensor(x, device=self.device)
+        vectors = F.embedding_bag(tensor(grams), self.char.float(), tensor(offsets), mode="mean")
+        if part_word:
+            parts = self.lemma_vectors[lang][tensor(part_lemma)].float() + F.embedding_bag(
+                tensor(tags), self.tag.float(), tensor(tag_offsets), mode="mean")
+            index = tensor(part_word)
+            total = torch.zeros_like(vectors).index_add_(0, index, parts)
+            count = torch.zeros(len(words), device=self.device).index_add_(0, index, torch.ones(len(index), device=self.device))
+            vectors = vectors + total / count.clamp(min=1)[:, None]
+        return vectors
+
+    def embed(self, word: str, lang: str) -> Tensor:
+        """Return the vector of ``word`` in the language ``lang`` (ISO 639-3 code, e.g. ``"myv"``)."""
+        key = f"{lang}|{word}"
+        if key not in self._cache:
+            self._cache[key] = self._vector(word, lang)
+        return self._cache[key].cpu()
+
+    def embed_many(self, words: Sequence[str], lang: str) -> Tensor:
+        return torch.stack([self.embed(word, lang) for word in words]) if words else torch.zeros(0, self.config["dimension"])
+
+    def similarity(self, first: str, second: str, lang: str, second_lang: Optional[str] = None) -> float:
+        """Cosine similarity of two words, which may be in different languages."""
+        return float(F.cosine_similarity(self.embed(first, lang), self.embed(second, second_lang or lang), dim=0))
+
+    def nearest_neighbors(self, word: str, lang: str, n: int = 10, target_lang: Optional[str] = None,
+                          vocabulary: Optional[Sequence[str]] = None) -> List[Tuple[str, float]]:
+        """The ``n`` words closest to ``word`` among ``vocabulary`` in ``target_lang`` (by default the lemmas of
+        that language).  For example ``nearest_neighbors("кудо", "myv", target_lang="fin")``."""
+        target = target_lang or lang
+        candidates = list(vocabulary) if vocabulary is not None else self.lemma_lists[target]
+        key = (target, None if vocabulary is not None else "lemmas")
+        if vocabulary is not None or getattr(self, "_matrix_key", None) != key:
+            chunks = range(0, len(candidates), 4096)
+            matrix = F.normalize(torch.cat([self._vectors(candidates[i:i + 4096], target) for i in tqdm(
+                chunks, desc=f"Embedding {target}", unit="batch", disable=len(candidates) < 5000)]), dim=1)
+            if vocabulary is None:
+                self._matrix, self._matrix_key = matrix, key
+        else:
+            matrix = self._matrix
+        scores = matrix @ F.normalize(self._vector(word, lang), dim=0)
+        values, ids = torch.topk(scores, min(n + 1, len(candidates)))
+        return [(candidates[int(i)], float(v)) for v, i in zip(values.cpu(), ids.cpu())
+                if not (target == lang and candidates[int(i)] == word)][:n]
+
+
+def _uralicnlp_analyzer(word: str, lang: str) -> List[str]:
+    from uralicNLP import uralicApi
+    return [analysis for analysis, _ in uralicApi.analyze(word, lang)]
+
+
+def load_morphemb(folder: Union[str, Path], languages: Sequence[str], *, analyzer: Union[str, Callable, Dict] = "uralicnlp",
+                  device: Optional[Union[str, torch.device]] = None) -> MorphEmbeddings:
+    """Load pretrained MorphEmb vectors for ``languages`` from ``folder`` (``shared.safetensors``, ``config.json`` and
+    ``lemmas/<lang>.*``) or from a Hugging Face model id such as ``"khalidmokha/morphemb"`` (only the files of the
+    given languages are downloaded).
+
+    ``analyzer`` gives the FST analyses of a word: ``"uralicnlp"`` (the default; run ``uralicApi.download(lang)``
+    once per language), a function ``(word, lang) -> ["lemma+TAG+TAG", ...]``, a dict ``{lang: path to an .hfstol
+    analyser}`` (read with pyhfst) or ``None`` (character n-grams only).
+    """
+    if not Path(folder).is_dir():  # a Hugging Face model id, e.g. "khalidmokha/morphemb"
+        from huggingface_hub import snapshot_download
+        folder = snapshot_download(str(folder), allow_patterns=["config.json", "shared.safetensors"] +
+                                   [f"lemmas/{lang}.*" for lang in languages])
+    if analyzer == "uralicnlp":
+        analyze = _uralicnlp_analyzer
+    elif isinstance(analyzer, dict):
+        per_lang = {lang: _load_analyzer(path) for lang, path in analyzer.items()}
+        analyze = lambda word, lang: per_lang[lang](word) if lang in per_lang else []
+    else:
+        analyze = analyzer
+    return MorphEmbeddings(folder, languages, analyze, device)

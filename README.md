@@ -45,6 +45,29 @@ model = word_embeddings.train("erzya_embeddings", files=["erzya.txt"],
 model = word_embeddings.load_model("erzya_embeddings")
 ```
 
+### Pretrained MorphEmb vectors for Uralic languages
+
+`load_morphemb` reads the pretrained MorphEmb vectors of Alnajjar et al. (2026)
+for 15 Uralic languages, English, Finnish and Russian. They were distilled from
+the LexiBERT encoder, so all of the languages share one vector space. The
+vectors are downloaded from Hugging Face
+([khalidmokha/morphemb](https://huggingface.co/khalidmokha/morphemb)), only for
+the languages you ask for; a local copy of that folder works as well. The FSTs
+come from UralicNLP (`uralicApi.download("myv")` once per language).
+
+```python
+from MLTools.LM import word_embeddings
+
+model = word_embeddings.load_morphemb("khalidmokha/morphemb", languages=["myv", "fin"])
+model.embed("кудосо", "myv")                        # any form the FST can analyse
+model.similarity("кудо", "talo", "myv", "fin")       # house ~ house
+model.nearest_neighbors("кудо", "myv", n=5, target_lang="fin")
+```
+
+Words that the FST does not know get only the character n-gram part of the
+vector. `analyzer` can also be a function `(word, lang) -> analyses`, for
+example one that falls back to a guesser, or `{lang: "analyser.hfstol"}`.
+
 ## Foundation models
 
 `foundation_models` is a small wrapper around Hugging Face encoder models. It
