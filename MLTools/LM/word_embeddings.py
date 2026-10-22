@@ -103,7 +103,10 @@ class _SkipGram(nn.Module):
 
     def vectors(self, words: Tensor, subword_ids: Optional[Tensor] = None, offsets: Optional[Tensor] = None,
                 morphology: Optional[Tuple[Tensor, Tensor, Tensor, Tensor]] = None) -> Tensor:
-        result = self.input(words)
+        # Negative ids denote unseen words: only their subword/morphological
+        # features contribute, with no learned vocabulary-word embedding.
+        result = self.input(words.clamp_min(0))
+        result = result.masked_fill(words.lt(0).unsqueeze(1), 0)
         if self.subwords is not None and subword_ids is not None and offsets is not None:
             result = result + self.subwords(subword_ids, offsets)
         if self.lemmas is not None and morphology is not None and len(morphology[0]):
@@ -148,7 +151,7 @@ class WordEmbeddings:
         return _morphology_tensors(words, self.analyzer, self.morph_vocab, self.device, self.config.get("max_analyses", 6))
 
     def _vectors(self, words: Sequence[str]) -> Tensor:
-        ids = torch.tensor([self.word_to_id.get(word, 0) for word in words], device=self.device)
+        ids = torch.tensor([self.word_to_id.get(word, -1) for word in words], device=self.device)
         subword_ids, offsets = self._subword_data(words)
         with torch.no_grad():
             vectors = self.network.vectors(ids, subword_ids, offsets, self._morphology(words))
